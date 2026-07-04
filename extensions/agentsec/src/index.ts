@@ -15,6 +15,8 @@ import { PuterService } from '@heyputer/backend/src/services/types.js';
 import { sign as jwtSign, verify as jwtVerify } from './jwt.js';
 import { TailscaleAPIProvisioner } from './tailscale.js';
 import type { GrantRequest, LeaseRecord, LeaseToken } from './types.js';
+import type { LeaseStore } from './lease-store.js';
+import { InMemoryLeaseStore } from './lease-store.js';
 
 // -- Constants --------------------------------------------------------------
 
@@ -71,7 +73,7 @@ interface PermissionSvc {
 // -- Service implementation -------------------------------------------------
 
 export class AgentSecGrantIssuer extends PuterService {
-    #leases = new Map<string, LeaseRecord>();
+    #leaseStore: LeaseStore;
     #tailscale: TailscaleACLProvisioner | null;
     #jwtSecret: string;
 
@@ -82,6 +84,7 @@ export class AgentSecGrantIssuer extends PuterService {
         services?: unknown,
         tailscale?: TailscaleACLProvisioner,
         jwtSecret?: string,
+        leaseStore?: LeaseStore,
     ) {
         // Boundary: the PuterService parent expects specific config/store/
         // service types that extensions don't import. The runtime values
@@ -94,6 +97,7 @@ export class AgentSecGrantIssuer extends PuterService {
         );
         this.#tailscale = tailscale ?? null;
         this.#jwtSecret = jwtSecret ?? JWT_SECRET;
+        this.#leaseStore = leaseStore ?? new InMemoryLeaseStore();
     }
 
     /**
@@ -125,15 +129,8 @@ export class AgentSecGrantIssuer extends PuterService {
      *   1. Validate the incoming JWT.
      *   2. Grant fs:<uid>:write for each target uid via PermissionService.
      *   3. Stub Layer-1 tailscale tag (provisionLeaseTag).
-     *   4. Record the lease in-memory.
+     *   4. Persist the lease via the configured LeaseStore.
      *   5. Sign and return a LeaseToken carrying the signed JWT.
-     *
-     * TODO: Persist leases to Puter KV when a KV service is exposed to
-     * extensions. Currently uses an in-memory Map — leases are lost on
-     * server restart.
-     *
-     * TODO: Set FSEntry.immutable on target files to prevent tampering
-     * during the lease window. Requires FSEntry update API.
      */
     async issueLease(
         actor: { user?: { id?: number; uuid?: string } },
@@ -199,7 +196,7 @@ export class AgentSecGrantIssuer extends PuterService {
             created_at: now,
             status: 'active',
         };
-        this.#leases.set(lease_id, record);
+        await this.#leaseStore.create(record);
 
         // -- Layer 3: sign the correlation token ----------------------
         const tokenPayload: Record<string, unknown> = {
@@ -235,21 +232,21 @@ export class AgentSecGrantIssuer extends PuterService {
     /**
      * Revoke all grants for a lease and mark the record.
      *
-     * The caller provides the actor — same pattern as issueLease.
-     *
-     * TODO: Set FSEntry.immutable = false on target files after
-     * revocation to restore writable state.
+     * After revoking the fs: grants, best-effort tries to set
+     * FSEntry.immutable on each target uid as defense-in-depth.
+     * The immutable flip is non-blocking — revocation completes
+     * regardless of any error from the fsEntry store.
      */
     async revokeLease(
         actor: { user?: { id?: number; uuid?: string } },
         lease_id: string,
     ): Promise<void> {
-        const record = this.#leases.get(lease_id);
+        const record = await this.#leaseStore.get(lease_id);
         if (!record) {
             throw new Error(`lease not found: ${lease_id}`);
         }
         if (record.status !== 'active') {
-            return; // already revoked or expired — idempotent
+            return; // already revoked or expired -- idempotent
         }
 
         // Unchecked cast: same rationale as issueLease.
@@ -266,7 +263,33 @@ export class AgentSecGrantIssuer extends PuterService {
 
         await this.#ensureTailscale(lease_id).revokeLeaseTag(lease_id);
 
-        record.status = 'expired';
+        await this.#leaseStore.setRevoked(lease_id, 'expired');
+
+        // -- Best-effort immutable defense-in-depth --------------------
+        // FSEntry.immutable hardens the lease boundary by preventing
+        // writes through any path once the lease is revoked.
+        // The grant revocation is the primary enforcement; immutable is
+        // a belt-and-suspenders measure. Errors never block revocation.
+        try {
+            const fsEntryStore = this.stores?.fsEntry as unknown as
+                { updateEntry: (uid: string, patch: { immutable?: boolean }) => Promise<unknown> }
+                | undefined;
+            if (fsEntryStore?.updateEntry) {
+                for (const uid of record.target_uids) {
+                    await fsEntryStore.updateEntry(uid, { immutable: true });
+                }
+            } else {
+                console.warn(
+                    `[agentsec] immutable defense-in-depth skipped ` +
+                    `for lease ${lease_id} — fsEntry store not reachable`,
+                );
+            }
+        } catch (immErr) {
+            console.warn(
+                `[agentsec] immutable defense-in-depth failed ` +
+                `for lease ${lease_id}: ${(immErr as Error).message}`,
+            );
+        }
     }
 
     /**
@@ -278,8 +301,10 @@ export class AgentSecGrantIssuer extends PuterService {
     ): Promise<number> {
         const now = Math.floor(Date.now() / 1000);
         const expired: string[] = [];
+        const all = await this.#leaseStore.listAll();
 
-        for (const [lease_id, record] of this.#leases) {
+        for (const record of all) {
+            const lease_id = record.lease_id;
             if (record.status === 'active' && record.exp <= now) {
                 expired.push(lease_id);
             }
