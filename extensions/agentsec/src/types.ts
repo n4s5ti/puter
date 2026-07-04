@@ -71,3 +71,58 @@ export interface GrantRequest {
      */
     token: string;
 }
+
+// -- Types for WritebackBroker --------------------------------------------
+
+/**
+ * A single file patch submitted as part of a writeback request.
+ * The caller provides the uid, the base hash they patched against,
+ * and the full new content.
+ */
+export interface WritebackPatch {
+    /** Target FSEntry uid — must be in the lease's target_uids */
+    uid: string;
+    /**
+     * SHA-256 hash of the content the caller patched against.
+     * Normalized form: strips 'sha256:' prefix if present, lowercases hex.
+     */
+    base_hash: string;
+    /** New full file content (diff application is a later refinement) */
+    content: string;
+}
+
+/**
+ * An incoming writeback request: a lease JWT + app identity + patches.
+ */
+export interface WritebackRequest {
+    /** The lease JWT (Layer 3) */
+    token: string;
+    /** The agent app identity */
+    app_uid: string;
+    /** Patches to apply — each must be covered by the lease */
+    patches: WritebackPatch[];
+}
+
+/**
+ * Reason a single-uid writeback was rejected.
+ */
+export type WritebackRejectReason =
+    | 'expired'
+    | 'lease_inactive'
+    | 'unleased'
+    | 'stale_hash'
+    | 'write_failed';
+
+/**
+ * Result of a writeback request: lists of applied and rejected patches.
+ * Per-patch isolation: rejected patches never block other patches.
+ */
+export interface WritebackResult {
+    lease_id: string;
+    applied: { uid: string }[];
+    rejected: {
+        uid: string;
+        reason: WritebackRejectReason;
+        detail?: string;
+    }[];
+}

@@ -17,6 +17,7 @@ import { TailscaleAPIProvisioner } from './tailscale.js';
 import type { GrantRequest, LeaseRecord, LeaseToken } from './types.js';
 import type { LeaseStore } from './lease-store.js';
 import { InMemoryLeaseStore } from './lease-store.js';
+import { WritebackBroker } from './writeback.js';
 
 // -- Constants --------------------------------------------------------------
 
@@ -321,3 +322,5 @@ export class AgentSecGrantIssuer extends PuterService {
 // -- Registration -----------------------------------------------------------
 
 extension.registerService('agentsec-grant-issuer', AgentSecGrantIssuer);
+
+export { WritebackBroker };
