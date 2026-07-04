@@ -15,9 +15,12 @@ import { PuterService } from '@heyputer/backend/src/services/types.js';
 import { sign as jwtSign, verify as jwtVerify } from './jwt.js';
 import { TailscaleAPIProvisioner } from './tailscale.js';
 import type { GrantRequest, LeaseRecord, LeaseToken } from './types.js';
+import type { ProvenanceEvent } from './types.js';
 import type { LeaseStore } from './lease-store.js';
 import { InMemoryLeaseStore } from './lease-store.js';
 import { WritebackBroker } from './writeback.js';
+import type { ProvenanceSink } from './provenance.js';
+import { NoOpProvenanceSink } from './provenance.js';
 
 // -- Constants --------------------------------------------------------------
 
@@ -77,6 +80,7 @@ export class AgentSecGrantIssuer extends PuterService {
     #leaseStore: LeaseStore;
     #tailscale: TailscaleACLProvisioner | null;
     #jwtSecret: string;
+    #provenance: ProvenanceSink;
 
     constructor(
         config?: unknown,
@@ -86,6 +90,7 @@ export class AgentSecGrantIssuer extends PuterService {
         tailscale?: TailscaleACLProvisioner,
         jwtSecret?: string,
         leaseStore?: LeaseStore,
+        provenance?: ProvenanceSink,
     ) {
         // Boundary: the PuterService parent expects specific config/store/
         // service types that extensions don't import. The runtime values
@@ -99,6 +104,7 @@ export class AgentSecGrantIssuer extends PuterService {
         this.#tailscale = tailscale ?? null;
         this.#jwtSecret = jwtSecret ?? JWT_SECRET;
         this.#leaseStore = leaseStore ?? new InMemoryLeaseStore();
+        this.#provenance = provenance ?? new NoOpProvenanceSink();
     }
 
     /**
@@ -117,6 +123,20 @@ export class AgentSecGrantIssuer extends PuterService {
             }
         }
         return this.#tailscale;
+    }
+
+    /**
+     * Best-effort provenance emission.
+     * Never throws — provenance failure MUST NOT block lifecycle operations.
+     */
+    #emitProvenance(event: ProvenanceEvent): void {
+        // Defer to microtask to avoid blocking the lifecycle operation.
+        // Any rejection is caught and logged; the caller never sees it.
+        this.#provenance.emit(event).catch((err: Error) => {
+            console.warn(
+                `[agentsec] provenance emit failed for ${event.type}:${event.lease_id} — ${err.message}`,
+            );
+        });
     }
 
     /**
@@ -199,6 +219,19 @@ export class AgentSecGrantIssuer extends PuterService {
         };
         await this.#leaseStore.create(record);
 
+        // -- Best-effort provenance ----------------------------------
+        this.#emitProvenance({
+            type: 'lease_issued',
+            lease_id,
+            ts: Date.now(),
+            anchor: req.anchor,
+            app_uid: req.app_uid,
+            uids: [...req.target_uids],
+            base_hashes: Object.fromEntries(
+                req.target_uids.map((uid, i) => [uid, req.base_hashes[i] ?? '']),
+            ),
+        });
+
         // -- Layer 3: sign the correlation token ----------------------
         const tokenPayload: Record<string, unknown> = {
             jti: lease_id,
@@ -266,11 +299,22 @@ export class AgentSecGrantIssuer extends PuterService {
 
         await this.#leaseStore.setRevoked(lease_id, 'expired');
 
+        // -- Best-effort provenance: lease revoked -------------------
+        this.#emitProvenance({
+            type: 'lease_revoked',
+            lease_id,
+            ts: Date.now(),
+            app_uid: record.app_uid,
+            uids: [...record.target_uids],
+            reason: 'revoked',
+        });
+
         // -- Best-effort immutable defense-in-depth --------------------
         // FSEntry.immutable hardens the lease boundary by preventing
         // writes through any path once the lease is revoked.
         // The grant revocation is the primary enforcement; immutable is
         // a belt-and-suspenders measure. Errors never block revocation.
+        let immutableFlipped = false;
         try {
             const fsEntryStore = this.stores?.fsEntry as unknown as
                 { updateEntry: (uid: string, patch: { immutable?: boolean }) => Promise<unknown> }
@@ -279,6 +323,7 @@ export class AgentSecGrantIssuer extends PuterService {
                 for (const uid of record.target_uids) {
                     await fsEntryStore.updateEntry(uid, { immutable: true });
                 }
+                immutableFlipped = true;
             } else {
                 console.warn(
                     `[agentsec] immutable defense-in-depth skipped ` +
@@ -290,6 +335,18 @@ export class AgentSecGrantIssuer extends PuterService {
                 `[agentsec] immutable defense-in-depth failed ` +
                 `for lease ${lease_id}: ${(immErr as Error).message}`,
             );
+            // Track as flipped if at least some uids succeeded.
+            // When the entire block throws we don't set the flag,
+            // so no immutable_set event is emitted.
+        } finally {
+            if (immutableFlipped) {
+                this.#emitProvenance({
+                    type: 'immutable_set',
+                    lease_id,
+                    ts: Date.now(),
+                    uids: [...record.target_uids],
+                });
+            }
         }
     }
 
@@ -312,7 +369,16 @@ export class AgentSecGrantIssuer extends PuterService {
         }
 
         for (const lease_id of expired) {
-            await this.revokeLease(actor, lease_id);
+            const record = await this.#leaseStore.get(lease_id);
+            if (record) {
+                await this.revokeLease(actor, lease_id);
+                this.#emitProvenance({
+                    type: 'lease_expired',
+                    lease_id,
+                    ts: Date.now(),
+                    uids: [...record.target_uids],
+                });
+            }
         }
 
         return expired.length;

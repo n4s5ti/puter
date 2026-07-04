@@ -14,19 +14,23 @@ vi.mock('@heyputer/backend/src/extensions', () => ({
 vi.mock('@heyputer/backend/src/services/types.js', () => ({
     PuterService: class PuterServiceMock {
         protected services: Record<string, unknown>;
+        protected stores: Record<string, unknown>;
 
         constructor(
             _config: unknown,
             _clients: unknown,
-            _stores: unknown,
+            stores: unknown,
             services: unknown,
         ) {
             this.services = services as Record<string, unknown>;
+            this.stores = stores as Record<string, unknown>;
         }
     },
 }));
 
 import { AgentSecGrantIssuer } from './index';
+import type { ProvenanceEvent } from './types.js';
+import type { ProvenanceSink } from './provenance.js';
 
 // -- Constants --------------------------------------------------------------
 
@@ -65,11 +69,29 @@ const makeDefaultRequest = (overrides: Record<string, unknown> = {}) => ({
 });
 
 const TEST_ACTOR = { user: { id: 1, uuid: 'user-uuid-1' } };
+// -- Capturing sink for provenance assertions ------------------------------
+
+class CapturingProvenanceSink implements ProvenanceSink {
+    readonly events: ProvenanceEvent[] = [];
+
+    async emit(event: ProvenanceEvent): Promise<void> {
+        this.events.push(event);
+    }
+
+    clear(): void {
+        this.events.length = 0;
+    }
+
+    eventsByType(type: ProvenanceEvent['type']): ProvenanceEvent[] {
+        return this.events.filter((e) => e.type === type);
+    }
+}
 
 // -- Tests ------------------------------------------------------------------
 
 describe('AgentSecGrantIssuer', () => {
     let grantIssuer: AgentSecGrantIssuer;
+    let captured: CapturingProvenanceSink;
     let mockPermSvc: {
         grantUserAppPermission: Mock;
         revokeUserAppPermission: Mock;
@@ -88,6 +110,7 @@ describe('AgentSecGrantIssuer', () => {
             provisionLeaseTag: vi.fn().mockResolvedValue(undefined),
             revokeLeaseTag: vi.fn().mockResolvedValue(undefined),
         };
+        captured = new CapturingProvenanceSink();
 
         grantIssuer = new AgentSecGrantIssuer(
             {},     // config
@@ -96,6 +119,8 @@ describe('AgentSecGrantIssuer', () => {
             { permission: mockPermSvc }, // services
             mockTailscale,
             TEST_SECRET,
+            undefined,  // leaseStore (default InMemory)
+            captured,   // provenance
         );
     });
 
@@ -154,6 +179,18 @@ describe('AgentSecGrantIssuer', () => {
             expect(mockTailscale.provisionLeaseTag).toHaveBeenCalledWith(
                 result.jti,
             );
+
+            // Provenance: lease_issued emitted with correct fields
+            const issued = captured.eventsByType('lease_issued');
+            expect(issued).toHaveLength(1);
+            expect(issued[0]).toMatchObject({
+                type: 'lease_issued',
+                lease_id: result.jti,
+                app_uid: 'app-123',
+                anchor: 'file-root-uid',
+            });
+            expect(issued[0].uids).toEqual(['file-a-uid', 'file-b-uid']);
+            expect(issued[0].ts).toBeGreaterThan(0);
         });
 
         it('rejects token with wrong app_uid', async () => {
@@ -245,6 +282,18 @@ describe('AgentSecGrantIssuer', () => {
             expect(mockTailscale.revokeLeaseTag).toHaveBeenCalledWith(
                 result.jti,
             );
+
+            // Provenance: lease_issued + lease_revoked emitted
+            const revoked = captured.eventsByType('lease_revoked');
+            expect(revoked).toHaveLength(1);
+            expect(revoked[0]).toMatchObject({
+                type: 'lease_revoked',
+                lease_id: result.jti,
+                app_uid: 'app-123',
+                uids: ['file-a-uid', 'file-b-uid'],
+                reason: 'revoked',
+            });
+            expect(revoked[0].ts).toBeGreaterThan(0);
         });
 
         it('is idempotent for already-revoked lease', async () => {
@@ -267,6 +316,49 @@ describe('AgentSecGrantIssuer', () => {
             await expect(
                 grantIssuer.revokeLease(TEST_ACTOR, 'nonexistent-lease'),
             ).rejects.toThrow('lease not found');
+        });
+
+        it('emits immutable_set when fsEntry store sets immutable on uids', async () => {
+            const mockFsEntryStore = {
+                updateEntry: vi.fn().mockResolvedValue(undefined),
+            };
+            const captureSink = new CapturingProvenanceSink();
+            const issuer = new AgentSecGrantIssuer(
+                {},
+                {},
+                { fsEntry: mockFsEntryStore },
+                { permission: mockPermSvc },
+                mockTailscale,
+                TEST_SECRET,
+                undefined,
+                captureSink,
+            );
+
+            const result = await issuer.issueLease(
+                TEST_ACTOR,
+                makeDefaultRequest(),
+            );
+
+            captureSink.clear();
+
+            await issuer.revokeLease(TEST_ACTOR, result.jti);
+
+            const immSet = captureSink.eventsByType('immutable_set');
+            expect(immSet).toHaveLength(1);
+            expect(immSet[0]).toMatchObject({
+                type: 'immutable_set',
+                lease_id: result.jti,
+                uids: ['file-a-uid', 'file-b-uid'],
+            });
+            expect(immSet[0].ts).toBeGreaterThan(0);
+
+            expect(mockFsEntryStore.updateEntry).toHaveBeenCalledTimes(2);
+            expect(mockFsEntryStore.updateEntry).toHaveBeenCalledWith(
+                'file-a-uid', { immutable: true },
+            );
+            expect(mockFsEntryStore.updateEntry).toHaveBeenCalledWith(
+                'file-b-uid', { immutable: true },
+            );
         });
     });
 
@@ -298,6 +390,15 @@ describe('AgentSecGrantIssuer', () => {
 
             expect(count).toBe(1);
             expect(mockPermSvc.revokeUserAppPermission).toHaveBeenCalled();
+
+            // Provenance: lease_expired emitted
+            const expired = captured.eventsByType('lease_expired');
+            expect(expired).toHaveLength(1);
+            expect(expired[0]).toMatchObject({
+                type: 'lease_expired',
+                uids: ['file-expired-uid'],
+            });
+            expect(expired[0].ts).toBeGreaterThan(0);
         });
 
         it('leaves active leases untouched', async () => {

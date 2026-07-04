@@ -126,3 +126,28 @@ export interface WritebackResult {
         detail?: string;
     }[];
 }
+
+// -- Provenance event types ------------------------------------------------
+
+export type ProvenanceEventType =
+    | 'lease_issued'
+    | 'writeback_applied'
+    | 'writeback_rejected'
+    | 'lease_revoked'
+    | 'lease_expired'
+    | 'immutable_set';
+
+export interface ProvenanceEvent {
+    type: ProvenanceEventType;
+    lease_id: string;
+    /** Epoch milliseconds */
+    ts: number;
+    anchor?: string;
+    app_uid?: string;
+    uids?: string[];
+    /** Map from uid to base content hash at lease-issuance time */
+    base_hashes?: Record<string, string>;
+    /** Reason for rejection / expiration */
+    reason?: string;
+    actor?: string;
+}

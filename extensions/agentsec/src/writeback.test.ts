@@ -4,9 +4,10 @@ import type { Mock } from 'vitest';
 import crypto from 'node:crypto';
 
 import type { LeaseStore } from './lease-store.js';
-import type { LeaseRecord, WritebackRequest } from './types.js';
+import type { LeaseRecord, WritebackRequest, ProvenanceEvent } from './types.js';
 import { WritebackBroker, normalizeHash } from './writeback.js';
 import type { JwtVerifyFn, FsServiceShim } from './writeback.js';
+import type { ProvenanceSink } from './provenance.js';
 
 // -- Constants --------------------------------------------------------------
 
@@ -106,6 +107,7 @@ describe('WritebackBroker', () => {
     let mockJwtVerify: Mock<JwtVerifyFn>;
     let mockFsService: FsServiceShim;
     let broker: WritebackBroker;
+    let captured: ProvenanceEvent[];
 
     beforeEach(() => {
         mockLeaseStore = {
@@ -124,12 +126,21 @@ describe('WritebackBroker', () => {
             write: vi.fn(),
         };
 
+        captured = [];
+
+        const sink: ProvenanceSink = {
+            async emit(event: ProvenanceEvent): Promise<void> {
+                captured.push(event);
+            },
+        };
+
         broker = new WritebackBroker(
             mockLeaseStore,
             mockJwtVerify as unknown as JwtVerifyFn,
             TEST_SECRET,
             TEST_AUDIENCE,
             mockFsService,
+            sink,
         );
     });
 
@@ -157,6 +168,23 @@ describe('WritebackBroker', () => {
                 UID_B,
                 'new content for B',
             );
+
+            // Provenance: 2 writeback_applied events, no rejections
+            const appliedEvents = captured.filter(
+                (e) => e.type === 'writeback_applied',
+            );
+            expect(appliedEvents).toHaveLength(2);
+            expect(appliedEvents[0]).toMatchObject({
+                type: 'writeback_applied',
+                lease_id: LEASE_ID,
+                app_uid: APP_UID,
+            });
+            expect(appliedEvents[0].uids).toEqual([UID_A]);
+            expect(appliedEvents[1].uids).toEqual([UID_B]);
+
+            expect(
+                captured.filter((e) => e.type === 'writeback_rejected'),
+            ).toHaveLength(0);
         });
     });
 
@@ -176,6 +204,9 @@ describe('WritebackBroker', () => {
             }
             // Lease store should NEVER be consulted for expired tokens
             expect(mockLeaseStore.get).not.toHaveBeenCalled();
+
+            // Provenance: no events emitted (early return before emit)
+            expect(captured).toHaveLength(0);
         });
 
         it('rejects all with expired when JWT missing jti claim', async () => {
@@ -189,6 +220,8 @@ describe('WritebackBroker', () => {
             expect(result.rejected).toHaveLength(2);
             expect(result.rejected[0].reason).toBe('expired');
             expect(result.rejected[0].detail).toContain('missing jti');
+
+            expect(captured).toHaveLength(0);
         });
 
         it('rejects all with expired when app_uid mismatches', async () => {
@@ -202,6 +235,8 @@ describe('WritebackBroker', () => {
             expect(result.rejected).toHaveLength(2);
             expect(result.rejected[0].reason).toBe('expired');
             expect(result.rejected[0].detail).toContain('app_uid');
+
+            expect(captured).toHaveLength(0);
         });
 
         it('returns lease_id empty when JWT is invalid', async () => {
@@ -212,6 +247,7 @@ describe('WritebackBroker', () => {
             const result = await broker.applyWriteback(makeHappyRequest());
 
             expect(result.lease_id).toBe('');
+            expect(captured).toHaveLength(0);
         });
     });
 
@@ -228,6 +264,7 @@ describe('WritebackBroker', () => {
                 expect(r.reason).toBe('lease_inactive');
                 expect(r.detail).toContain('not found');
             }
+            expect(captured).toHaveLength(0);
         });
 
         it('rejects all with lease_inactive when lease status is revoked', async () => {
@@ -242,6 +279,7 @@ describe('WritebackBroker', () => {
                 expect(r.reason).toBe('lease_inactive');
                 expect(r.detail).toContain('revoked');
             }
+            expect(captured).toHaveLength(0);
         });
 
         it('sets lease_id even when lease is inactive', async () => {
@@ -251,6 +289,7 @@ describe('WritebackBroker', () => {
             const result = await broker.applyWriteback(makeHappyRequest());
 
             expect(result.lease_id).toBe(LEASE_ID);
+            expect(captured).toHaveLength(0);
         });
     });
 
@@ -286,6 +325,23 @@ describe('WritebackBroker', () => {
             });
 
             expect(mockFsService.write).toHaveBeenCalledTimes(2);
+
+            // Provenance: 2 writeback_applied + 1 writeback_rejected
+            const appliedEvents = captured.filter(
+                (e) => e.type === 'writeback_applied',
+            );
+            expect(appliedEvents).toHaveLength(2);
+            const rejectedEvents = captured.filter(
+                (e) => e.type === 'writeback_rejected',
+            );
+            expect(rejectedEvents).toHaveLength(1);
+            expect(rejectedEvents[0]).toMatchObject({
+                type: 'writeback_rejected',
+                lease_id: LEASE_ID,
+                app_uid: APP_UID,
+                uids: ['unleased-uid'],
+                reason: 'unleased',
+            });
         });
     });
 
@@ -321,11 +377,27 @@ describe('WritebackBroker', () => {
                 reason: 'stale_hash',
             });
             expect(result.rejected[0].detail).toContain('content hash');
-            // detail should mention lease base_hash since current != HASH_B
             expect(result.rejected[0].detail).toContain('lease base_hash');
 
             expect(mockFsService.write).toHaveBeenCalledTimes(1);
             expect(mockFsService.write).toHaveBeenCalledWith(UID_A, 'new A');
+
+            // Provenance: 1 writeback_applied + 1 writeback_rejected
+            const appliedEvents = captured.filter(
+                (e) => e.type === 'writeback_applied',
+            );
+            expect(appliedEvents).toHaveLength(1);
+            expect(appliedEvents[0].uids).toEqual([UID_A]);
+            const rejectedEvents = captured.filter(
+                (e) => e.type === 'writeback_rejected',
+            );
+            expect(rejectedEvents).toHaveLength(1);
+            expect(rejectedEvents[0]).toMatchObject({
+                type: 'writeback_rejected',
+                lease_id: LEASE_ID,
+                app_uid: APP_UID,
+            });
+            expect(rejectedEvents[0].reason).toBe('stale_hash');
         });
 
         it('rejects patch when patch base_hash does not match current content', async () => {
@@ -379,6 +451,22 @@ describe('WritebackBroker', () => {
                 uid: UID_B,
                 reason: 'write_failed',
                 detail: 'Disk full',
+            });
+
+            // Provenance: 1 writeback_applied + 1 writeback_rejected (write_failed)
+            const appliedEvents = captured.filter(
+                (e) => e.type === 'writeback_applied',
+            );
+            expect(appliedEvents).toHaveLength(1);
+            const rejectedEvents = captured.filter(
+                (e) => e.type === 'writeback_rejected',
+            );
+            expect(rejectedEvents).toHaveLength(1);
+            expect(rejectedEvents[0]).toMatchObject({
+                type: 'writeback_rejected',
+                lease_id: LEASE_ID,
+                app_uid: APP_UID,
+                reason: 'write_failed',
             });
         });
     });
@@ -448,6 +536,7 @@ describe('WritebackBroker', () => {
             expect(result.applied).toEqual([]);
             expect(result.rejected).toEqual([]);
             expect(result.lease_id).toBe(LEASE_ID);
+            expect(captured).toHaveLength(0);
         });
 
         it('rejects all patches when fsService is null', async () => {

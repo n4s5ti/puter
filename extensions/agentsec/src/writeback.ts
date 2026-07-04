@@ -14,7 +14,9 @@
 
 import crypto from 'node:crypto';
 import type { LeaseStore } from './lease-store.js';
-import type { WritebackRequest, WritebackPatch, WritebackResult } from './types.js';
+import type { WritebackRequest, WritebackPatch, WritebackResult, ProvenanceEvent } from './types.js';
+import type { ProvenanceSink } from './provenance.js';
+import { NoOpProvenanceSink } from './provenance.js';
 
 // -- Types ------------------------------------------------------------------
 
@@ -82,6 +84,7 @@ export class WritebackBroker {
     readonly #jwtSecret: string;
     readonly #jwtAudience: string;
     readonly #fsService: FsServiceShim | null;
+    readonly #provenance: ProvenanceSink;
 
     constructor(
         leaseStore: LeaseStore,
@@ -89,12 +92,14 @@ export class WritebackBroker {
         jwtSecret: string,
         jwtAudience: string = JWT_AUDIENCE,
         fsService: FsServiceShim | null = null,
+        provenance?: ProvenanceSink,
     ) {
         this.#leaseStore = leaseStore;
         this.#jwtVerify = jwtVerify;
         this.#jwtSecret = jwtSecret;
         this.#jwtAudience = jwtAudience;
         this.#fsService = fsService;
+        this.#provenance = provenance ?? new NoOpProvenanceSink();
     }
 
     /**
@@ -263,6 +268,55 @@ export class WritebackBroker {
             }
         }
 
+        // -- Best-effort provenance: writeback events ------------------------
+        this.#emitProvenanceEvents(leaseId, req.app_uid, applied, rejected);
+
         return { lease_id: leaseId, applied, rejected };
+    }
+
+    /**
+     * Emit provenance events for writeback results.
+     * Best-effort: failures never block the writeback lifecycle.
+     */
+    #emitProvenanceEvents(
+        leaseId: string,
+        appUid: string,
+        applied: { uid: string }[],
+        rejected: { uid: string; reason: string; detail?: string }[],
+    ): void {
+        const ts = Date.now();
+
+        for (const { uid } of applied) {
+            this.#emitOne({
+                type: 'writeback_applied',
+                lease_id: leaseId,
+                ts,
+                app_uid: appUid,
+                uids: [uid],
+            });
+        }
+
+        for (const { uid, reason } of rejected) {
+            this.#emitOne({
+                type: 'writeback_rejected',
+                lease_id: leaseId,
+                ts,
+                app_uid: appUid,
+                uids: [uid],
+                reason,
+            });
+        }
+    }
+
+    /**
+     * Best-effort single provenance emission.
+     * Never throws — provenance failure MUST NOT block lifecycle operations.
+     */
+    #emitOne(event: ProvenanceEvent): void {
+        this.#provenance.emit(event).catch((err: Error) => {
+            console.warn(
+                `[agentsec] provenance emit failed for ${event.type}:${event.lease_id} — ${err.message}`,
+            );
+        });
     }
 }
