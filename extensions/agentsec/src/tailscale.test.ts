@@ -9,15 +9,32 @@ import { TailscaleAPIProvisioner } from './tailscale.js';
 const TAILNET = 'cyprus-ling.ts.net';
 const API_BASE = `https://api.tailscale.com/api/v2/tailnet/${TAILNET}/acl`;
 
-/** Build a minimal ACL policy for test fixtures. */
+/** Build a realistic Tailscale policy for test fixtures (grants format). */
 function makePolicy(
-    overrides: Partial<{ acls: unknown[] }> = {},
+    overrides: Partial<{
+        tagOwners: Record<string, string[]>;
+        grants: Array<{ src: string[]; dst: string[]; ip: string[] }>;
+        ssh: unknown[];
+        hosts: Record<string, string>;
+    }> = {},
 ): Record<string, unknown> {
     return {
-        acls: [
-            { action: 'accept', src: ['tag:existing'], dst: ['existing:443'] },
-        ],
         tagOwners: { 'tag:existing': ['autogroup:admin'] },
+        grants: [
+            {
+                src: ['tag:existing'],
+                dst: ['writeback-broker'],
+                ip: ['tcp:443'],
+            },
+        ],
+        ssh: [
+            {
+                action: 'accept',
+                src: ['autogroup:admin'],
+                dst: ['tag:existing'],
+                users: ['root'],
+            },
+        ],
         ...overrides,
     };
 }
@@ -53,7 +70,7 @@ describe('TailscaleAPIProvisioner', () => {
     });
 
     describe('provisionLeaseTag', () => {
-        it('appends a new tag rule and POSTs the updated policy', async () => {
+        it('adds tagOwners entry and grants rule, POSTs updated policy', async () => {
             const policy = makePolicy();
             mockFetch
                 .mockResolvedValueOnce(mockResponse(policy))
@@ -61,7 +78,7 @@ describe('TailscaleAPIProvisioner', () => {
 
             await provisioner.provisionLeaseTag('lease-abc');
 
-            // First call: GET current ACL
+            // First call: GET current policy
             expect(mockFetch).toHaveBeenNthCalledWith(
                 1,
                 API_BASE,
@@ -70,7 +87,7 @@ describe('TailscaleAPIProvisioner', () => {
                 }),
             );
 
-            // Second call: POST updated ACL with new rule appended
+            // Second call: POST updated policy
             const postCall = mockFetch.mock.calls[1];
             expect(postCall[0]).toBe(API_BASE);
             expect(postCall[1]).toMatchObject({
@@ -81,41 +98,107 @@ describe('TailscaleAPIProvisioner', () => {
                 },
             });
             const postedBody = JSON.parse(postCall[1].body as string);
-            expect(postedBody.acls).toHaveLength(2);
-            expect(postedBody.acls[1]).toEqual({
-                action: 'accept',
-                src: ['tag:agent-lease-abc'],
-                dst: ['writeback-broker:443'],
+
+            // Verify tagOwners — new tag added alongside existing
+            expect(postedBody.tagOwners).toEqual({
+                'tag:existing': ['autogroup:admin'],
+                'tag:agent-lease-abc': ['autogroup:admin'],
             });
-            // Original rule and tagOwners preserved
-            expect(postedBody.tagOwners).toEqual(policy.tagOwners);
+
+            // Verify grants — new rule appended
+            expect(postedBody.grants).toHaveLength(2);
+            expect(postedBody.grants[1]).toEqual({
+                src: ['tag:agent-lease-abc'],
+                dst: ['writeback-broker'],
+                ip: ['*'],
+            });
+
+            // Verify existing ssh key preserved verbatim
+            expect(postedBody.ssh).toEqual(policy.ssh);
         });
 
-        it('is idempotent when the tag rule already exists', async () => {
+        it('is idempotent when tagOwners entry and grants rule already exist', async () => {
             const policy = makePolicy({
-                acls: [
-                    { action: 'accept', src: ['tag:existing'], dst: ['existing:443'] },
-                    { action: 'accept', src: ['tag:agent-dup'], dst: ['writeback-broker:443'] },
+                tagOwners: {
+                    'tag:existing': ['autogroup:admin'],
+                    'tag:agent-dup': ['autogroup:admin'],
+                },
+                grants: [
+                    {
+                        src: ['tag:existing'],
+                        dst: ['writeback-broker'],
+                        ip: ['tcp:443'],
+                    },
+                    {
+                        src: ['tag:agent-dup'],
+                        dst: ['writeback-broker'],
+                        ip: ['*'],
+                    },
                 ],
             });
             mockFetch.mockResolvedValueOnce(mockResponse(policy));
 
             await provisioner.provisionLeaseTag('dup');
 
-            // Only one fetch call (GET) — no POST since rule already exists
+            // Only GET — no POST since tag already fully provisioned
             expect(mockFetch).toHaveBeenCalledTimes(1);
+        });
+
+        it('POSTs strict JSON even when GET returned hujson', async () => {
+            const hujsonBody = `{
+                "tagOwners": {
+                    "tag:existing": ["autogroup:admin"],
+                },
+                "grants": [
+                    {
+                        "src": ["tag:existing"],
+                        "dst": ["writeback-broker"],
+                        "ip": ["tcp:443"],
+                    },
+                ],
+                "ssh": [
+                    {"action": "accept", "src": ["autogroup:admin"], "dst": ["tag:existing"], "users": ["root"]},
+                ],
+                // trailing comment
+            }`;
+            mockFetch
+                .mockResolvedValueOnce(mockResponse(hujsonBody))
+                .mockResolvedValueOnce(mockResponse({}));
+
+            await provisioner.provisionLeaseTag('strict-json');
+
+            const postCall = mockFetch.mock.calls[1];
+            const bodyStr = postCall[1].body as string;
+
+            // Must parse with standard JSON (no trailing commas, no comments)
+            expect(() => JSON.parse(bodyStr)).not.toThrow();
+            expect(bodyStr).not.toMatch(/,(\s*[}\]])/);
+            expect(bodyStr).not.toContain('//');
+
+            const postedBody = JSON.parse(bodyStr);
+            expect(postedBody.tagOwners['tag:agent-strict-json']).toEqual([
+                'autogroup:admin',
+            ]);
         });
     });
 
     describe('revokeLeaseTag', () => {
-        it('removes the matching tag rule and POSTs the updated policy', async () => {
+        it('removes the matching tagOwners entry and grants rule, POSTs update', async () => {
             const policy = makePolicy({
-                acls: [
-                    { action: 'accept', src: ['tag:existing'], dst: ['existing:443'] },
+                tagOwners: {
+                    'tag:existing': ['autogroup:admin'],
+                    'tag:agent-to-revoke': ['autogroup:admin'],
+                },
+                grants: [
                     {
-                        action: 'accept',
+                        src: ['tag:existing'],
+                        dst: ['writeback-broker'],
+                        ip: ['tcp:443'],
+                    },
+                    {
                         src: ['tag:agent-to-revoke'],
-                        dst: ['writeback-broker:443'],
+                        dst: ['writeback-broker'],
+                        ip: ['*'],
                     },
                 ],
             });
@@ -126,11 +209,21 @@ describe('TailscaleAPIProvisioner', () => {
             await provisioner.revokeLeaseTag('to-revoke');
 
             const postBody = JSON.parse(mockFetch.mock.calls[1][1].body as string);
-            expect(postBody.acls).toHaveLength(1);
-            expect(postBody.acls[0].src).toEqual(['tag:existing']);
+
+            // tagOwners: revoked tag removed
+            expect(postBody.tagOwners).toEqual({
+                'tag:existing': ['autogroup:admin'],
+            });
+
+            // grants: revoked rule removed, existing rule preserved
+            expect(postBody.grants).toHaveLength(1);
+            expect(postBody.grants[0].src).toEqual(['tag:existing']);
+
+            // ssh preserved
+            expect(postBody.ssh).toEqual(policy.ssh);
         });
 
-        it('is idempotent when the tag rule does not exist', async () => {
+        it('is idempotent when the tag does not exist', async () => {
             const policy = makePolicy();
             mockFetch.mockResolvedValueOnce(mockResponse(policy));
 
@@ -144,22 +237,29 @@ describe('TailscaleAPIProvisioner', () => {
     describe('auth readiness', () => {
         it('throws a clear error when TAILSCALE_API_KEY is missing', () => {
             delete process.env.TAILSCALE_API_KEY;
+            process.env.AGENTSEC_TAILSCALE_ENV = '/nonexistent/env/file';
 
             expect(() => new TailscaleAPIProvisioner()).toThrow(
                 'TAILSCALE_API_KEY not set',
             );
+
+            delete process.env.AGENTSEC_TAILSCALE_ENV;
         });
     });
 
     describe('hujson tolerance', () => {
-        it('parses a GET response with trailing commas and dashes', async () => {
+        it('parses a GET response with trailing commas and comments', async () => {
             const hujsonBody = `{
-                "acls": [
-                    {"action": "accept", "src": ["tag:existing"], "dst": ["existing:443"]},
-                ],
                 "tagOwners": {
                     "tag:existing": ["autogroup:admin"],
                 },
+                "grants": [
+                    {
+                        "src": ["tag:existing"],
+                        "dst": ["writeback-broker"],
+                        "ip": ["tcp:443"],
+                    },
+                ],
                 // trailing comment
             }`;
             mockFetch
@@ -169,8 +269,40 @@ describe('TailscaleAPIProvisioner', () => {
             await provisioner.provisionLeaseTag('hujson-lease');
 
             const postBody = JSON.parse(mockFetch.mock.calls[1][1].body as string);
-            expect(postBody.acls).toHaveLength(2);
-            expect(postBody.acls[1].src).toEqual(['tag:agent-hujson-lease']);
+            expect(postBody.tagOwners['tag:agent-hujson-lease']).toEqual([
+                'autogroup:admin',
+            ]);
+            expect(postBody.grants).toHaveLength(2);
+            expect(postBody.grants[1].src).toEqual(['tag:agent-hujson-lease']);
+        });
+    });
+
+    describe('error handling', () => {
+        it('throws a clear error when grants array is missing from response', async () => {
+            const badPolicy = { tagOwners: {}, ssh: [] };
+            mockFetch.mockResolvedValueOnce(mockResponse(badPolicy));
+
+            await expect(
+                provisioner.provisionLeaseTag('no-grants'),
+            ).rejects.toThrow('no "grants" array');
+        });
+
+        it('preserves additional top-level keys through read-modify-write', async () => {
+            const policy = makePolicy({
+                hosts: { 'my-node': '100.64.0.1' },
+                nodeAttrs: [{ target: ['tag:existing'], attr: ['some-attr'] }],
+            });
+            mockFetch
+                .mockResolvedValueOnce(mockResponse(policy))
+                .mockResolvedValueOnce(mockResponse({}));
+
+            await provisioner.provisionLeaseTag('extras-lease');
+
+            const postBody = JSON.parse(mockFetch.mock.calls[1][1].body as string);
+            expect(postBody.hosts).toEqual({ 'my-node': '100.64.0.1' });
+            expect(postBody.nodeAttrs).toEqual([
+                { target: ['tag:existing'], attr: ['some-attr'] },
+            ]);
         });
     });
 });

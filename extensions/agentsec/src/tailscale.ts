@@ -5,6 +5,11 @@
 //
 // Auth: reads TAILSCALE_API_KEY from ~/.config/agentsec/tailscale.env
 // (or AGENTSEC_TAILSCALE_ENV override). File must be mode 0600.
+//
+// TODO: Add auth-key minting (POST /api/v2/tailnet/{tailnet}/keys) so
+// provisionLeaseTag can also create an ephemeral auth key scoped to the
+// newly provisioned tag. This is a follow-up; for now the caller must
+// create auth keys out of band.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -14,16 +19,18 @@ import type { TailscaleACLProvisioner } from './index.js';
 
 // -- Types ------------------------------------------------------------------
 
-/** The ACL policy shape returned by the Tailscale API. */
+/** The Tailscale policy shape returned by the API (grants format). */
 interface TailscalePolicy {
-    acls: TailscaleACLRule[];
+    tagOwners: Record<string, string[]>;
+    grants: TailscaleGrantRule[];
     [key: string]: unknown;
 }
 
-interface TailscaleACLRule {
-    action: string;
+/** A single grants-format rule (no action/proto — uses ip instead). */
+interface TailscaleGrantRule {
     src: string[];
     dst: string[];
+    ip: string[];
 }
 
 // -- Helpers ----------------------------------------------------------------
@@ -68,6 +75,7 @@ export class TailscaleAPIProvisioner implements TailscaleACLProvisioner {
     readonly #apiKey: string;
     readonly #tailnet: string;
     readonly #brokerHost: string;
+    readonly #brokerPorts: string[];
 
     constructor() {
         // Read env file
@@ -83,6 +91,12 @@ export class TailscaleAPIProvisioner implements TailscaleACLProvisioner {
             || fileEnv.AGENTSEC_BROKER_HOST
             || 'writeback-broker';
 
+        const brokerPortsRaw = process.env.AGENTSEC_BROKER_PORTS
+            || fileEnv.AGENTSEC_BROKER_PORTS
+            || '*';
+        const ports = brokerPortsRaw.split(',').map(s => s.trim()).filter(Boolean);
+        this.#brokerPorts = ports.length > 0 ? ports : ['*'];
+
         if (!this.#apiKey) {
             throw new Error(
                 'AgentSec: TAILSCALE_API_KEY not set — ' +
@@ -95,7 +109,7 @@ export class TailscaleAPIProvisioner implements TailscaleACLProvisioner {
         return `https://api.tailscale.com/api/v2/tailnet/${this.#tailnet}`;
     }
 
-    async #fetchACLs(): Promise<TailscalePolicy> {
+    async #fetchPolicy(): Promise<TailscalePolicy> {
         const url = `${this.#apiBase()}/acl`;
         const res = await fetch(url, {
             headers: { Authorization: `Bearer ${this.#apiKey}` },
@@ -126,14 +140,23 @@ export class TailscaleAPIProvisioner implements TailscaleACLProvisioner {
 
         const policy = parsed as Record<string, unknown>;
 
-        if (!Array.isArray(policy.acls)) {
-            throw new Error('AgentSec: Tailscale ACL response has no "acls" array');
+        if (!Array.isArray(policy.grants)) {
+            throw new Error('AgentSec: Tailscale ACL response has no "grants" array');
         }
 
-        return { acls: policy.acls as TailscaleACLRule[], ...policy };
+        // Normalise missing tagOwners to empty object
+        if (typeof policy.tagOwners !== 'object' || policy.tagOwners === null) {
+            policy.tagOwners = {};
+        }
+
+        return {
+            tagOwners: policy.tagOwners as Record<string, string[]>,
+            grants: policy.grants as TailscaleGrantRule[],
+            ...policy,
+        };
     }
 
-    async #applyACLs(policy: TailscalePolicy): Promise<void> {
+    async #applyPolicy(policy: TailscalePolicy): Promise<void> {
         const url = `${this.#apiBase()}/acl`;
         const res = await fetch(url, {
             method: 'POST',
@@ -154,36 +177,51 @@ export class TailscaleAPIProvisioner implements TailscaleACLProvisioner {
 
     async provisionLeaseTag(lease_id: string): Promise<void> {
         const tag = `tag:agent-${lease_id}`;
-        const rule: TailscaleACLRule = {
-            action: 'accept',
-            src: [tag],
-            dst: [`${this.#brokerHost}:443`],
-        };
+        const policy = await this.#fetchPolicy();
+        let changed = false;
 
-        const policy = await this.#fetchACLs();
-
-        // Idempotent: skip if a rule for this exact src already exists
-        if (policy.acls.some((r) => r.src.some((s) => s === tag))) {
-            return;
+        // Ensure tagOwners entry exists (idempotent)
+        if (!policy.tagOwners[tag]) {
+            policy.tagOwners[tag] = ['autogroup:admin'];
+            changed = true;
         }
 
-        policy.acls.push(rule);
-        await this.#applyACLs(policy);
+        // Append grants rule if not already present (idempotent)
+        if (!policy.grants.some(r => r.src.some(s => s === tag))) {
+            policy.grants.push({
+                src: [tag],
+                dst: [this.#brokerHost],
+                ip: [...this.#brokerPorts],
+            });
+            changed = true;
+        }
+
+        if (changed) {
+            await this.#applyPolicy(policy);
+        }
     }
 
     async revokeLeaseTag(lease_id: string): Promise<void> {
         const tag = `tag:agent-${lease_id}`;
+        const policy = await this.#fetchPolicy();
 
-        const policy = await this.#fetchACLs();
+        let changed = false;
 
-        const before = policy.acls.length;
-        policy.acls = policy.acls.filter((r) => !r.src.some((s) => s === tag));
-
-        // Idempotent: no-op if nothing removed
-        if (policy.acls.length === before) {
-            return;
+        // Remove from tagOwners
+        if (tag in policy.tagOwners) {
+            delete policy.tagOwners[tag];
+            changed = true;
         }
 
-        await this.#applyACLs(policy);
+        // Remove from grants
+        const before = policy.grants.length;
+        policy.grants = policy.grants.filter(r => !r.src.some(s => s === tag));
+        if (policy.grants.length !== before) {
+            changed = true;
+        }
+
+        if (changed) {
+            await this.#applyPolicy(policy);
+        }
     }
 }
