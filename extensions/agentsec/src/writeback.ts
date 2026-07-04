@@ -120,52 +120,66 @@ export class WritebackBroker {
             decoded = this.#jwtVerify(req.token, this.#jwtSecret, this.#jwtAudience);
         } catch {
             // Token invalid or expired — reject all patches
-            for (const patch of req.patches) {
-                rejected.push({
-                    uid: patch.uid,
-                    reason: 'expired',
-                    detail: 'JWT is invalid or expired',
-                });
-            }
-            return { lease_id: '', applied, rejected };
+            const detail = 'JWT is invalid or expired';
+            this.#emitRejected('', req.app_uid, req.patches, 'expired', detail);
+            return {
+                lease_id: '',
+                applied: [],
+                rejected: req.patches.map((p) => ({
+                    uid: p.uid,
+                    reason: 'expired' as const,
+                    detail,
+                })),
+            };
         }
 
         const leaseId = (decoded.jti as string) ?? '';
         if (!leaseId) {
-            for (const patch of req.patches) {
-                rejected.push({
-                    uid: patch.uid,
-                    reason: 'expired',
-                    detail: 'JWT missing jti (lease_id)',
-                });
-            }
-            return { lease_id: '', applied, rejected };
+            const detail = 'JWT missing jti (lease_id)';
+            this.#emitRejected('', req.app_uid, req.patches, 'expired', detail);
+            return {
+                lease_id: '',
+                applied: [],
+                rejected: req.patches.map((p) => ({
+                    uid: p.uid,
+                    reason: 'expired' as const,
+                    detail,
+                })),
+            };
         }
 
         // Validate app_uid matches
         const tokenAppUid = decoded.app_uid as string | undefined;
         if (tokenAppUid !== req.app_uid) {
-            for (const patch of req.patches) {
-                rejected.push({
-                    uid: patch.uid,
-                    reason: 'expired',
-                    detail: `JWT app_uid "${tokenAppUid}" does not match request app_uid "${req.app_uid}"`,
-                });
-            }
-            return { lease_id: '', applied, rejected };
+            const detail = `JWT app_uid "${tokenAppUid}" does not match request app_uid "${req.app_uid}"`;
+            this.#emitRejected('', req.app_uid, req.patches, 'expired', detail);
+            return {
+                lease_id: '',
+                applied: [],
+                rejected: req.patches.map((p) => ({
+                    uid: p.uid,
+                    reason: 'expired' as const,
+                    detail,
+                })),
+            };
         }
 
         // -- Step 2: Look up and validate the lease record ------------------
         const record = await this.#leaseStore.get(leaseId);
         if (!record || record.status !== 'active') {
-            const reason: 'lease_inactive' = 'lease_inactive';
             const detail = !record
                 ? `Lease "${leaseId}" not found`
                 : `Lease "${leaseId}" has status "${record.status}" (must be "active")`;
-            for (const patch of req.patches) {
-                rejected.push({ uid: patch.uid, reason, detail });
-            }
-            return { lease_id: leaseId, applied, rejected };
+            this.#emitRejected(leaseId, req.app_uid, req.patches, 'lease_inactive', detail);
+            return {
+                lease_id: leaseId,
+                applied: [],
+                rejected: req.patches.map((p) => ({
+                    uid: p.uid,
+                    reason: 'lease_inactive' as const,
+                    detail,
+                })),
+            };
         }
 
         // -- Step 3: Per-patch validation and application --------------------
@@ -272,6 +286,31 @@ export class WritebackBroker {
         this.#emitProvenanceEvents(leaseId, req.app_uid, applied, rejected);
 
         return { lease_id: leaseId, applied, rejected };
+    }
+
+    /**
+     * Emit writeback_rejected provenance for all patches in a batch.
+     * Used by early-return branches (JWT invalid, lease_inactive).
+     */
+    #emitRejected(
+        leaseId: string,
+        appUid: string,
+        patches: WritebackPatch[],
+        reason: string,
+        detail: string,
+    ): void {
+        const now = Date.now();
+        for (const p of patches) {
+            this.#emitOne({
+                type: 'writeback_rejected',
+                lease_id: leaseId,
+                ts: now,
+                app_uid: appUid,
+                uids: [p.uid],
+                reason,
+                detail,
+            });
+        }
     }
 
     /**

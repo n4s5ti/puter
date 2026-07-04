@@ -206,7 +206,12 @@ describe('WritebackBroker', () => {
             expect(mockLeaseStore.get).not.toHaveBeenCalled();
 
             // Provenance: no events emitted (early return before emit)
-            expect(captured).toHaveLength(0);
+            expect(captured.filter((e) => e.type === 'writeback_rejected')).toHaveLength(2);
+            for (const evt of captured) {
+                expect(evt.type).toBe('writeback_rejected');
+                expect(evt.reason).toBe('expired');
+                expect(evt.lease_id).toBe('');
+            }
         });
 
         it('rejects all with expired when JWT missing jti claim', async () => {
@@ -221,7 +226,12 @@ describe('WritebackBroker', () => {
             expect(result.rejected[0].reason).toBe('expired');
             expect(result.rejected[0].detail).toContain('missing jti');
 
-            expect(captured).toHaveLength(0);
+            expect(captured.filter((e) => e.type === 'writeback_rejected')).toHaveLength(2);
+            for (const evt of captured) {
+                expect(evt.type).toBe('writeback_rejected');
+                expect(evt.reason).toBe('expired');
+                expect(evt.lease_id).toBe('');
+            }
         });
 
         it('rejects all with expired when app_uid mismatches', async () => {
@@ -236,7 +246,12 @@ describe('WritebackBroker', () => {
             expect(result.rejected[0].reason).toBe('expired');
             expect(result.rejected[0].detail).toContain('app_uid');
 
-            expect(captured).toHaveLength(0);
+            expect(captured.filter((e) => e.type === 'writeback_rejected')).toHaveLength(2);
+            for (const evt of captured) {
+                expect(evt.type).toBe('writeback_rejected');
+                expect(evt.reason).toBe('expired');
+                expect(evt.lease_id).toBe('');
+            }
         });
 
         it('returns lease_id empty when JWT is invalid', async () => {
@@ -247,7 +262,12 @@ describe('WritebackBroker', () => {
             const result = await broker.applyWriteback(makeHappyRequest());
 
             expect(result.lease_id).toBe('');
-            expect(captured).toHaveLength(0);
+            expect(captured.filter((e) => e.type === 'writeback_rejected')).toHaveLength(2);
+            for (const evt of captured) {
+                expect(evt.type).toBe('writeback_rejected');
+                expect(evt.reason).toBe('expired');
+                expect(evt.lease_id).toBe('');
+            }
         });
     });
 
@@ -264,7 +284,12 @@ describe('WritebackBroker', () => {
                 expect(r.reason).toBe('lease_inactive');
                 expect(r.detail).toContain('not found');
             }
-            expect(captured).toHaveLength(0);
+            expect(captured.filter((e) => e.type === 'writeback_rejected')).toHaveLength(2);
+            for (const evt of captured) {
+                expect(evt.type).toBe('writeback_rejected');
+                expect(evt.reason).toBe('lease_inactive');
+                expect(evt.lease_id).toBe(LEASE_ID);
+            }
         });
 
         it('rejects all with lease_inactive when lease status is revoked', async () => {
@@ -279,7 +304,12 @@ describe('WritebackBroker', () => {
                 expect(r.reason).toBe('lease_inactive');
                 expect(r.detail).toContain('revoked');
             }
-            expect(captured).toHaveLength(0);
+            expect(captured.filter((e) => e.type === 'writeback_rejected')).toHaveLength(2);
+            for (const evt of captured) {
+                expect(evt.type).toBe('writeback_rejected');
+                expect(evt.reason).toBe('lease_inactive');
+                expect(evt.lease_id).toBe(LEASE_ID);
+            }
         });
 
         it('sets lease_id even when lease is inactive', async () => {
@@ -289,7 +319,12 @@ describe('WritebackBroker', () => {
             const result = await broker.applyWriteback(makeHappyRequest());
 
             expect(result.lease_id).toBe(LEASE_ID);
-            expect(captured).toHaveLength(0);
+            expect(captured.filter((e) => e.type === 'writeback_rejected')).toHaveLength(2);
+            for (const evt of captured) {
+                expect(evt.type).toBe('writeback_rejected');
+                expect(evt.reason).toBe('lease_inactive');
+                expect(evt.lease_id).toBe(LEASE_ID);
+            }
         });
     });
 
