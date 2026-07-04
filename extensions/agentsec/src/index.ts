@@ -13,6 +13,7 @@ import crypto from 'node:crypto';
 import { extension } from '@heyputer/backend/src/extensions';
 import { PuterService } from '@heyputer/backend/src/services/types.js';
 import { sign as jwtSign, verify as jwtVerify } from './jwt.js';
+import { TailscaleAPIProvisioner } from './tailscale.js';
 import type { GrantRequest, LeaseRecord, LeaseToken } from './types.js';
 
 // -- Constants --------------------------------------------------------------
@@ -71,7 +72,7 @@ interface PermissionSvc {
 
 export class AgentSecGrantIssuer extends PuterService {
     #leases = new Map<string, LeaseRecord>();
-    #tailscale: TailscaleACLProvisioner;
+    #tailscale: TailscaleACLProvisioner | null;
     #jwtSecret: string;
 
     constructor(
@@ -91,8 +92,26 @@ export class AgentSecGrantIssuer extends PuterService {
             stores as never,
             services as never,
         );
-        this.#tailscale = tailscale ?? new NoOpTailscaleACLProvisioner();
+        this.#tailscale = tailscale ?? null;
         this.#jwtSecret = jwtSecret ?? JWT_SECRET;
+    }
+
+    /**
+     * Ensure the tailscale provisioner is initialized.
+     * Deferred so that extension startup does not fail when the env file
+     * is missing — the error surfaces only on first lease operation.
+     */
+    #ensureTailscale(lease_id: string): TailscaleACLProvisioner {
+        if (!this.#tailscale) {
+            try {
+                this.#tailscale = new TailscaleAPIProvisioner();
+            } catch (e) {
+                throw new Error(
+                    `AgentSec: cannot manage tailscale tag for lease ${lease_id} — ${(e as Error).message}`,
+                );
+            }
+        }
+        return this.#tailscale;
     }
 
     /**
@@ -166,7 +185,7 @@ export class AgentSecGrantIssuer extends PuterService {
         }
 
         // -- Layer 1: stub --------------------------------------------
-        await this.#tailscale.provisionLeaseTag(lease_id);
+        await this.#ensureTailscale(lease_id).provisionLeaseTag(lease_id);
 
         // -- Record the lease -----------------------------------------
         const now = Math.floor(Date.now() / 1000);
@@ -245,7 +264,7 @@ export class AgentSecGrantIssuer extends PuterService {
             );
         }
 
-        await this.#tailscale.revokeLeaseTag(lease_id);
+        await this.#ensureTailscale(lease_id).revokeLeaseTag(lease_id);
 
         record.status = 'expired';
     }
