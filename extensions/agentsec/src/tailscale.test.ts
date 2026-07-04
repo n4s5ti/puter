@@ -23,7 +23,7 @@ function makePolicy(
         grants: [
             {
                 src: ['tag:existing'],
-                dst: ['writeback-broker'],
+                dst: ['tag:writeback-broker'],
                 ip: ['tcp:443'],
             },
         ],
@@ -70,7 +70,7 @@ describe('TailscaleAPIProvisioner', () => {
     });
 
     describe('provisionLeaseTag', () => {
-        it('adds tagOwners entry and grants rule, POSTs updated policy', async () => {
+        it('adds tagOwners entries and grants rule, POSTs updated policy', async () => {
             const policy = makePolicy();
             mockFetch
                 .mockResolvedValueOnce(mockResponse(policy))
@@ -99,17 +99,18 @@ describe('TailscaleAPIProvisioner', () => {
             });
             const postedBody = JSON.parse(postCall[1].body as string);
 
-            // Verify tagOwners — new tag added alongside existing
+            // Verify tagOwners — broker tag + new lease tag alongside existing
             expect(postedBody.tagOwners).toEqual({
                 'tag:existing': ['autogroup:admin'],
+                'tag:writeback-broker': ['autogroup:admin'],
                 'tag:agent-lease-abc': ['autogroup:admin'],
             });
 
-            // Verify grants — new rule appended
+            // Verify grants — new rule appended with broker tag as dst
             expect(postedBody.grants).toHaveLength(2);
             expect(postedBody.grants[1]).toEqual({
                 src: ['tag:agent-lease-abc'],
-                dst: ['writeback-broker'],
+                dst: ['tag:writeback-broker'],
                 ip: ['*'],
             });
 
@@ -117,21 +118,45 @@ describe('TailscaleAPIProvisioner', () => {
             expect(postedBody.ssh).toEqual(policy.ssh);
         });
 
-        it('is idempotent when tagOwners entry and grants rule already exist', async () => {
+        it('does NOT duplicate broker tag when already present in tagOwners', async () => {
+            const policy = makePolicy({
+                tagOwners: {
+                    'tag:existing': ['autogroup:admin'],
+                    'tag:writeback-broker': ['autogroup:admin'],
+                },
+            });
+            mockFetch
+                .mockResolvedValueOnce(mockResponse(policy))
+                .mockResolvedValueOnce(mockResponse({}));
+
+            await provisioner.provisionLeaseTag('new-lease');
+
+            const postBody = JSON.parse(mockFetch.mock.calls[1][1].body as string);
+
+            // Broker tag appears exactly once
+            expect(postBody.tagOwners).toEqual({
+                'tag:existing': ['autogroup:admin'],
+                'tag:writeback-broker': ['autogroup:admin'],
+                'tag:agent-new-lease': ['autogroup:admin'],
+            });
+        });
+
+        it('is idempotent when tagOwners entries and grants rule already exist', async () => {
             const policy = makePolicy({
                 tagOwners: {
                     'tag:existing': ['autogroup:admin'],
                     'tag:agent-dup': ['autogroup:admin'],
+                    'tag:writeback-broker': ['autogroup:admin'],
                 },
                 grants: [
                     {
                         src: ['tag:existing'],
-                        dst: ['writeback-broker'],
+                        dst: ['tag:writeback-broker'],
                         ip: ['tcp:443'],
                     },
                     {
                         src: ['tag:agent-dup'],
-                        dst: ['writeback-broker'],
+                        dst: ['tag:writeback-broker'],
                         ip: ['*'],
                     },
                 ],
@@ -152,7 +177,7 @@ describe('TailscaleAPIProvisioner', () => {
                 "grants": [
                     {
                         "src": ["tag:existing"],
-                        "dst": ["writeback-broker"],
+                        "dst": ["tag:writeback-broker"],
                         "ip": ["tcp:443"],
                     },
                 ],
@@ -183,21 +208,22 @@ describe('TailscaleAPIProvisioner', () => {
     });
 
     describe('revokeLeaseTag', () => {
-        it('removes the matching tagOwners entry and grants rule, POSTs update', async () => {
+        it('removes the matching tagOwners entry and grants rule, preserves broker tag, POSTs update', async () => {
             const policy = makePolicy({
                 tagOwners: {
                     'tag:existing': ['autogroup:admin'],
                     'tag:agent-to-revoke': ['autogroup:admin'],
+                    'tag:writeback-broker': ['autogroup:admin'],
                 },
                 grants: [
                     {
                         src: ['tag:existing'],
-                        dst: ['writeback-broker'],
+                        dst: ['tag:writeback-broker'],
                         ip: ['tcp:443'],
                     },
                     {
                         src: ['tag:agent-to-revoke'],
-                        dst: ['writeback-broker'],
+                        dst: ['tag:writeback-broker'],
                         ip: ['*'],
                     },
                 ],
@@ -210,9 +236,10 @@ describe('TailscaleAPIProvisioner', () => {
 
             const postBody = JSON.parse(mockFetch.mock.calls[1][1].body as string);
 
-            // tagOwners: revoked tag removed
+            // tagOwners: revoked tag removed, broker tag preserved
             expect(postBody.tagOwners).toEqual({
                 'tag:existing': ['autogroup:admin'],
+                'tag:writeback-broker': ['autogroup:admin'],
             });
 
             // grants: revoked rule removed, existing rule preserved
@@ -256,7 +283,7 @@ describe('TailscaleAPIProvisioner', () => {
                 "grants": [
                     {
                         "src": ["tag:existing"],
-                        "dst": ["writeback-broker"],
+                        "dst": ["tag:writeback-broker"],
                         "ip": ["tcp:443"],
                     },
                 ],

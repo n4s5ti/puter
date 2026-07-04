@@ -74,7 +74,7 @@ function stripHujson(text: string): string {
 export class TailscaleAPIProvisioner implements TailscaleACLProvisioner {
     readonly #apiKey: string;
     readonly #tailnet: string;
-    readonly #brokerHost: string;
+    readonly #brokerTag: string;
     readonly #brokerPorts: string[];
 
     constructor() {
@@ -87,9 +87,9 @@ export class TailscaleAPIProvisioner implements TailscaleACLProvisioner {
         this.#tailnet = process.env.TAILSCALE_TAILNET
             || fileEnv.TAILSCALE_TAILNET
             || 'cyprus-ling.ts.net';
-        this.#brokerHost = process.env.AGENTSEC_BROKER_HOST
-            || fileEnv.AGENTSEC_BROKER_HOST
-            || 'writeback-broker';
+        this.#brokerTag = process.env.AGENTSEC_BROKER_TAG
+            || fileEnv.AGENTSEC_BROKER_TAG
+            || 'tag:writeback-broker';
 
         const brokerPortsRaw = process.env.AGENTSEC_BROKER_PORTS
             || fileEnv.AGENTSEC_BROKER_PORTS
@@ -180,17 +180,24 @@ export class TailscaleAPIProvisioner implements TailscaleACLProvisioner {
         const policy = await this.#fetchPolicy();
         let changed = false;
 
-        // Ensure tagOwners entry exists (idempotent)
+        // 1. Ensure the broker tag exists in tagOwners so a node can carry it
+        //    (persistent infrastructure shared across all leases)
+        if (!(this.#brokerTag in policy.tagOwners)) {
+            policy.tagOwners[this.#brokerTag] = ['autogroup:admin'];
+            changed = true;
+        }
+
+        // 2. Ensure the lease tag exists in tagOwners (idempotent)
         if (!policy.tagOwners[tag]) {
             policy.tagOwners[tag] = ['autogroup:admin'];
             changed = true;
         }
 
-        // Append grants rule if not already present (idempotent)
+        // 3. Append grants rule if not already present (idempotent)
         if (!policy.grants.some(r => r.src.some(s => s === tag))) {
             policy.grants.push({
                 src: [tag],
-                dst: [this.#brokerHost],
+                dst: [this.#brokerTag],
                 ip: [...this.#brokerPorts],
             });
             changed = true;
@@ -207,18 +214,21 @@ export class TailscaleAPIProvisioner implements TailscaleACLProvisioner {
 
         let changed = false;
 
-        // Remove from tagOwners
+        // Remove lease tag from tagOwners
         if (tag in policy.tagOwners) {
             delete policy.tagOwners[tag];
             changed = true;
         }
 
-        // Remove from grants
+        // Remove lease grant from grants
         const before = policy.grants.length;
         policy.grants = policy.grants.filter(r => !r.src.some(s => s === tag));
         if (policy.grants.length !== before) {
             changed = true;
         }
+
+        // The broker tag is persistent infrastructure shared across all leases;
+        // we never remove it from tagOwners here.
 
         if (changed) {
             await this.#applyPolicy(policy);
