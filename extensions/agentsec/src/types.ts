@@ -205,3 +205,40 @@ export interface LearningRecord {
     /** Epoch milliseconds when the record was created */
     recorded_at: number;
 }
+// -- Signal calculator types -----------------------------------------------
+
+/**
+ * Raw stream event captured by an external sniffer (pi-agent / AG-UI).
+ * Richer than AgentStreamEvent — includes tokens, tool_args, and tool_result
+ * that the SignalCalculator consumes to DERIVE SemanticSignals deterministically.
+ */
+export interface StreamEvent {
+    /** Unique identifier for this reasoning step */
+    step_id: string;
+    /** Token delta / reasoning text produced this step */
+    tokens?: string;
+    /** Tool name the agent is about to call */
+    proposed_tool?: string;
+    /** Arguments for the proposed tool call */
+    tool_args?: Record<string, unknown>;
+    /** Result text returned by the tool */
+    tool_result?: string;
+    /** Free-text summary of the agent's current context */
+    context_summary?: string;
+}
+
+/**
+ * User-defined anchor: the goal, constraints, and non-goals that bound the
+ * agent's trajectory. The SignalCalculator compares every StreamEvent against
+ * this anchor to derive semantic signals.
+ */
+export interface Anchor {
+    /** The user's goal text */
+    goal: string;
+    /** Stated constraints the agent must not violate */
+    constraints?: string[];
+    /** Explicit non-goals — actions the agent must avoid entirely */
+    non_goals?: string[];
+    /** Extracted intent terms (optional helper for j_drift computation) */
+    intent_keywords?: string[];
+}
