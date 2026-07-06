@@ -1,5 +1,7 @@
 // -- Types for AgentSec grant-issuer ---------------------------------------
 
+import type { SemanticSignals, ControlState } from './janus-harness.js';
+
 /**
  * Claims carried by a JWT lease token.
  * The token authorizes the grant-issuer (a user-backed service) to issue
@@ -135,11 +137,15 @@ export type ProvenanceEventType =
     | 'writeback_rejected'
     | 'lease_revoked'
     | 'lease_expired'
-    | 'immutable_set';
+    | 'immutable_set'
+    | 'oracle_freeze'
+    | 'oracle_resume'
+    | 'learning_recorded';
 
 export interface ProvenanceEvent {
     type: ProvenanceEventType;
-    lease_id: string;
+    /** Lease identifier; optional for oracle events that don't track a lease */
+    lease_id?: string;
     /** Epoch milliseconds */
     ts: number;
     anchor?: string;
@@ -147,7 +153,55 @@ export interface ProvenanceEvent {
     uids?: string[];
     /** Map from uid to base content hash at lease-issuance time */
     base_hashes?: Record<string, string>;
-    /** Reason for rejection / expiration */
+    /** Reason for rejection / expiration / freeze */
     reason?: string;
     actor?: string;
+}
+
+// -- Oracle loop types ------------------------------------------------------
+
+export interface AgentStreamEvent {
+    /** Unique identifier for this reasoning step */
+    step_id: string;
+    /** The tool call the agent is about to make (undefined for pure-reasoning steps) */
+    proposed_tool?: string;
+    /** The 4 semantic signals the model emits at this step */
+    signals: SemanticSignals;
+    /** Free-text summary of the agent's current context */
+    context_summary?: string;
+}
+
+export type FreezeReason =
+    | 'high_j_t'
+    | 'pause_action'
+    | 'rollback_action'
+    | 'seductive_failure'
+    | 'chaotic_lambda';
+
+export interface FreezeDecision {
+    /** Whether the agent should freeze before the proposed tool call */
+    freeze: boolean;
+    /** Why the freeze was triggered (undefined when freeze=false) */
+    reason?: FreezeReason;
+    /** Composite tension signal at decision time */
+    j_t: number;
+    /** Action the JanusHarness recommended */
+    action: ControlState['action'];
+    /** Lambda pattern classification at decision time */
+    lambda: ControlState['lambda_observe'];
+    /** The step_id this decision corresponds to */
+    step_id: string;
+    /** If seductive-failure match, the LearningRecord id that matched */
+    matched_learning_id?: string;
+}
+
+export interface LearningRecord {
+    /** Unique identifier */
+    id: string;
+    /** Normalized signature of the action/context */
+    action_signature: string;
+    /** Whether the trajectory resolved to a convergent or non-convergent outcome */
+    outcome: 'convergent' | 'non_convergent';
+    /** Epoch milliseconds when the record was created */
+    recorded_at: number;
 }
